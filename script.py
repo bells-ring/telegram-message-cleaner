@@ -1,60 +1,72 @@
-import asyncio, os, configparser, re
+import asyncio
+import configparser
+import re
 from datetime import datetime, timezone
-from telethon import TelegramClient, utils as tl_utils
+
+from telethon import TelegramClient
+from telethon import utils as tl_utils
 from telethon.tl.types import User, Chat, Channel
 from telethon.errors import FloodWaitError, MessageDeleteForbiddenError, ChatAdminRequiredError
 
-_config = configparser.ConfigParser()
-_config.read('config.ini', encoding='utf-8')
 
-API_ID   = _config.getint('settings', 'api_id')
-API_HASH = _config.get('settings', 'api_hash')
-BATCH    = _config.getint('settings', 'batch')
-DELAY    = _config.getfloat('settings', 'delay')
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg.read('config.ini', encoding='utf-8')
+    return cfg
 
-_raw_chats = _config.get('whitelist', 'chats', fallback='')
-WHITELIST = [
-    int(x) if x.lstrip('-').isdigit() else x
-    for x in _raw_chats.split(',') if x.strip()
-]
 
-_raw_msgs = _config.get('message_whitelist', 'messages', fallback='')
-_MSG_WHITELIST_ENTRIES = [x.strip() for x in _raw_msgs.split(',') if x.strip()]
+def parse_whitelist(cfg):
+    raw = cfg.get('whitelist', 'chats', fallback='')
+    return [
+        int(x) if x.lstrip('-').isdigit() else x
+        for x in raw.split(',') if x.strip()
+    ]
 
-async def resolve_msg_whitelist(client):
+
+def parse_msg_whitelist_entries(cfg):
+    raw = cfg.get('message_whitelist', 'messages', fallback='')
+    return [x.strip() for x in raw.split(',') if x.strip()]
+
+
+async def resolve_msg_whitelist(client, entries):
     result = {}
-    for entry in _MSG_WHITELIST_ENTRIES:
+    for entry in entries:
         m = re.match(r'https?://t\.me/c/(\d+)/(\d+)', entry)
         if m:
             chat_id = int('-100' + m.group(1))
-            msg_id  = int(m.group(2))
+            msg_id = int(m.group(2))
             result.setdefault(chat_id, set()).add(msg_id)
             continue
+
         m = re.match(r'https?://t\.me/([a-zA-Z][^/]+)/(\d+)$', entry)
         if m:
             username = m.group(1)
-            msg_id   = int(m.group(2))
+            msg_id = int(m.group(2))
             try:
-                entity  = await client.get_entity(username)
+                entity = await client.get_entity(username)
                 chat_id = tl_utils.get_peer_id(entity)
                 result.setdefault(chat_id, set()).add(msg_id)
             except Exception as e:
                 print(f"  [!] message_whitelist: не удалось разрешить @{username}: {e}")
             continue
+
         if ':' in entry:
             parts = entry.split(':', 1)
             if parts[0].lstrip('-').isdigit() and parts[1].isdigit():
                 result.setdefault(int(parts[0]), set()).add(int(parts[1]))
                 continue
+
         print(f"  [!] message_whitelist: не распознан формат '{entry}'")
+
     return result
+
 
 def fmt(d):
     e = d.entity
     name = (
         getattr(e, 'title', None)
         or ' '.join(filter(None, [getattr(e, 'first_name', ''), getattr(e, 'last_name', '')]))
-        or '—'
+        or '?'
     )
     username = getattr(e, 'username', None)
     s = f"id:{d.id}"
@@ -67,11 +79,12 @@ def fmt(d):
         s += "  [бот]"
     return s
 
+
 def fmt_entity(e):
     name = (
         getattr(e, 'title', None)
         or ' '.join(filter(None, [getattr(e, 'first_name', ''), getattr(e, 'last_name', '')]))
-        or '—'
+        or '?'
     )
     username = getattr(e, 'username', None)
     s = f"uid:{e.id}"
@@ -80,58 +93,74 @@ def fmt_entity(e):
     s += f"  {name}"
     return s
 
+
 def parse_date(prompt):
-    s = input(prompt).strip()
-    if not s:
-        return None
-    for fmt_str in ('%d.%m.%Y %H:%M', '%d.%m.%Y'):
-        try:
-            return datetime.strptime(s, fmt_str).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    print(f"  [!] Формат не тот: нужно ДД.ММ.ГГГГ или ДД.ММ.ГГГГ ЧЧ:ММ, введено '{s}'")
-    return None
+    while True:
+        s = input(prompt).strip()
+        if not s:
+            return None
+        for fmt_str in ('%d.%m.%Y %H:%M', '%d.%m.%Y'):
+            try:
+                return datetime.strptime(s, fmt_str).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        print(f"  [!] Формат не тот: нужно ДД.ММ.ГГГГ или ДД.ММ.ГГГГ ЧЧ:ММ, введено '{s}'. Попробуй ещё раз или Enter для пропуска.")
+
 
 def ask_dates():
-    print("\nФильтр по датам UTC (Enter - пропустить):")
-    min_date = parse_date("  Не раньше (ДД.ММ.ГГГГ [ЧЧ:ММ]): ")
-    max_date = parse_date("  Не позже  (ДД.ММ.ГГГГ [ЧЧ:ММ]): ")
-    if min_date and max_date and min_date > max_date:
-        print("  [!] Начало позже конца - даты игнорирую")
-        return None, None
-    return min_date, max_date
+    print("\nФильтр по датам UTC (Enter — пропустить):")
+    while True:
+        min_date = parse_date("  Не раньше (ДД.ММ.ГГГГ [ЧЧ:ММ]): ")
+        max_date = parse_date("  Не позже  (ДД.ММ.ГГГГ [ЧЧ:ММ]): ")
+        if min_date and max_date and min_date > max_date:
+            print("  [!] Начало позже конца. Введи даты заново.")
+            continue
+        return min_date, max_date
+
 
 def matches_type(d, selected):
     e = d.entity
-    if 1 in selected and isinstance(e, User):                        return True
-    if 2 in selected and isinstance(e, Chat):                        return True
-    if 3 in selected and isinstance(e, Channel) and e.megagroup:     return True
-    if 4 in selected and isinstance(e, Channel) and not e.megagroup: return True
+    if 1 in selected and isinstance(e, User):
+        return True
+    if 2 in selected and isinstance(e, Chat):
+        return True
+    if 3 in selected and isinstance(e, Channel) and e.megagroup:
+        return True
+    if 4 in selected and isinstance(e, Channel) and not e.megagroup:
+        return True
     return False
 
-async def delete(client, entity, ids, label):
+
+async def delete(client, entity, ids, label, batch, delay):
     total = 0
-    for i in range(0, len(ids), BATCH):
-        chunk = ids[i:i + BATCH]
-        while True:
+    for i in range(0, len(ids), batch):
+        chunk = ids[i:i + batch]
+        retries = 0
+        while retries < 3:
             try:
                 await client.delete_messages(entity, chunk)
                 total += len(chunk)
                 print(f"  [{label}] {total}/{len(ids)}", end='\r')
-                await asyncio.sleep(DELAY)
+                await asyncio.sleep(delay)
                 break
             except FloodWaitError as e:
-                print(f"\n  FloodWait {e.seconds + 2}с...")
-                await asyncio.sleep(e.seconds + 2)
+                wait = e.seconds + 2
+                print(f"\n  FloodWait {wait}с...")
+                await asyncio.sleep(wait)
             except (MessageDeleteForbiddenError, ChatAdminRequiredError):
                 print(f"\n  [{label}] нет прав, пропускаю")
                 return total
             except Exception as e:
-                print(f"\n  [{label}] ошибка: {e}, пропускаю")
-                return total
+                retries += 1
+                print(f"\n  [{label}] ошибка ({retries}/3): {e}")
+                if retries >= 3:
+                    print(f"  [{label}] превышен лимит попыток, пропускаю чанк")
+                    break
+                await asyncio.sleep(2 * retries)
     return total
 
-async def run_deletion(client, found):
+
+async def run_deletion(client, found, batch, delay):
     if not found:
         print("\n[!] Ничего не нашлось.")
         return
@@ -156,28 +185,39 @@ async def run_deletion(client, found):
 
     grand = 0
     for entity, ids, label in found:
-        grand += await delete(client, entity, ids, label)
+        grand += await delete(client, entity, ids, label, batch, delay)
         print()
 
     print(f"\n[+] Готово, удалено: {grand}")
 
+
 async def collect_dialog(client, entity, is_private=False, min_date=None, max_date=None, msg_whitelist=None):
+    entity_label = getattr(entity, 'id', repr(entity))
     try:
         chat_id = tl_utils.get_peer_id(entity)
-        wl_ids  = msg_whitelist.get(chat_id, set()) if msg_whitelist else set()
+        entity_label = chat_id
+        wl_ids = msg_whitelist.get(chat_id, set()) if msg_whitelist else set()
 
         kwargs = {'from_user': 'me'}
         if max_date:
             kwargs['offset_date'] = max_date
 
         if not is_private:
-            probe = await client.get_messages(entity, limit=1, **kwargs)
+            while True:
+                try:
+                    probe = await client.get_messages(entity, limit=1, **kwargs)
+                    break
+                except FloodWaitError as e:
+                    print(f"\n  FloodWait (probe) {e.seconds + 2}с...")
+                    await asyncio.sleep(e.seconds + 2)
             if not probe:
                 return [], 0
 
         ids = []
         skipped = 0
         async for m in client.iter_messages(entity, **kwargs):
+            if max_date and m.date > max_date:
+                continue
             if min_date and m.date < min_date:
                 break
             if m.id in wl_ids:
@@ -185,10 +225,12 @@ async def collect_dialog(client, entity, is_private=False, min_date=None, max_da
             else:
                 ids.append(m.id)
         return ids, skipped
-    except Exception:
+    except Exception as e:
+        print(f"  [!] Ошибка при сканировании {entity_label}: {e}")
         return [], 0
 
-async def source_session(client, msg_whitelist):
+
+async def source_session(client, msg_whitelist, whitelist, batch, delay):
     while True:
         print("\nЧто сканируем (можно несколько через запятую):")
         print("  0 - назад")
@@ -242,16 +284,19 @@ async def source_session(client, msg_whitelist):
                         print(f"        {label}: 0 сообщений{skipped_str}")
                 except Exception as e:
                     print(f"  [!] '{target}' не вышло: {e}")
-            await run_deletion(client, found)
+            await run_deletion(client, found, batch, delay)
             continue
 
         bot_filter = None
         if 1 in selected:
             print("\nКого смотрим в личках:\n  0 - назад\n  1 - только люди\n  2 - только боты\n  3 - всех")
             bf = input("Выбор: ").strip()
-            if bf == '0': continue
-            if bf == '1': bot_filter = False
-            elif bf == '2': bot_filter = True
+            if bf == '0':
+                continue
+            if bf == '1':
+                bot_filter = False
+            elif bf == '2':
+                bot_filter = True
 
         min_date, max_date = ask_dates()
 
@@ -259,12 +304,14 @@ async def source_session(client, msg_whitelist):
         found = []
 
         async for d in client.iter_dialogs():
-            if not matches_type(d, selected): continue
-            if d.id in WHITELIST or getattr(d.entity, 'username', None) in WHITELIST:
+            if not matches_type(d, selected):
+                continue
+            if d.id in whitelist or getattr(d.entity, 'username', None) in whitelist:
                 print(f"  [whitelist]  {fmt(d)}")
                 continue
             if d.is_user and bot_filter is not None:
-                if bool(getattr(d.entity, 'bot', False)) != bot_filter: continue
+                if bool(getattr(d.entity, 'bot', False)) != bot_filter:
+                    continue
 
             ids, skipped = await collect_dialog(
                 client, d.entity,
@@ -278,14 +325,23 @@ async def source_session(client, msg_whitelist):
                 skipped_str = f"  [whitelist: {skipped}]" if skipped else ""
                 print(f"  {len(found):>3}.  {len(ids):>5} сообщ.  {label}{skipped_str}")
 
-        await run_deletion(client, found)
+        await run_deletion(client, found, batch, delay)
+
 
 async def main():
-    async with TelegramClient('session', API_ID, API_HASH) as client:
+    cfg = load_config()
+    api_id = cfg.getint('settings', 'api_id')
+    api_hash = cfg.get('settings', 'api_hash')
+    batch = cfg.getint('settings', 'batch')
+    delay = cfg.getfloat('settings', 'delay')
+    whitelist = parse_whitelist(cfg)
+    msg_entries = parse_msg_whitelist_entries(cfg)
+
+    async with TelegramClient('session', api_id, api_hash) as client:
         me = await client.get_me()
         print(f"\n[+] Привет, {me.first_name}  (uid:{me.id})")
 
-        msg_whitelist = await resolve_msg_whitelist(client)
+        msg_whitelist = await resolve_msg_whitelist(client, msg_entries)
         if msg_whitelist:
             total = sum(len(v) for v in msg_whitelist.values())
             print(f"  message_whitelist: {total} сообщ. в {len(msg_whitelist)} чатах")
@@ -295,11 +351,12 @@ async def main():
             src = input("Выбор: ").strip()
 
             if src == '1':
-                await source_session(client, msg_whitelist)
+                await source_session(client, msg_whitelist, whitelist, batch, delay)
             elif src == '2':
                 print("Пока.")
                 break
             else:
                 print("Нет такого варианта.")
+
 
 asyncio.run(main())
