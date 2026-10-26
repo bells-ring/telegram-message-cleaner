@@ -1,12 +1,20 @@
 import asyncio
 import configparser
 import re
+import time
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
 from telethon import utils as tl_utils
-from telethon.tl.types import User, Chat, Channel
-from telethon.errors import FloodWaitError, MessageDeleteForbiddenError, ChatAdminRequiredError
+from telethon.tl.types import User, Chat, Channel, ReactionPaid, UpdateMessageReactions
+from telethon.tl.functions.messages import SendReactionRequest, GetMessagesReactionsRequest
+from telethon.errors import (
+    FloodWaitError, MessageDeleteForbiddenError, ChatAdminRequiredError,
+    SessionPasswordNeededError, MessageIdInvalidError, MsgIdInvalidError,
+    MessageNotModifiedError, ReactionInvalidError, ChatWriteForbiddenError,
+    UserBannedInChannelError, ChannelPrivateError, PeerIdInvalidError,
+)
+from getpass import getpass
 
 
 def load_config():
@@ -131,17 +139,50 @@ def matches_type(d, selected):
     return False
 
 
+def pace_left(started, delay):
+    # Пауза считается от начала запроса, а не от ответа: время ответа сервера входит в delay
+    return max(0.0, delay - (time.monotonic() - started))
+
+
+async def call_flood_safe(client, request, what):
+    while True:
+        try:
+            return await client(request)
+        except FloodWaitError as e:
+            print(f"\n  FloodWait ({what}) {e.seconds + 2}с...")
+            await asyncio.sleep(e.seconds + 2)
+
+
+async def iter_history(client, entity, scan_delay, **kwargs):
+    # iter_messages с продолжением после долгого FloodWait с того же места, а не с начала
+    offset_id = 0
+    while True:
+        try:
+            async for m in client.iter_messages(entity, offset_id=offset_id, wait_time=scan_delay, **kwargs):
+                offset_id = m.id
+                yield m
+            return
+        except FloodWaitError as e:
+            print(f"\n  FloodWait (скан) {e.seconds + 2}с...")
+            await asyncio.sleep(e.seconds + 2)
+            if offset_id:
+                kwargs.pop('offset_date', None)
+
+
 async def delete(client, entity, ids, label, batch, delay):
     total = 0
+    done = set()
     for i in range(0, len(ids), batch):
         chunk = ids[i:i + batch]
         retries = 0
         while retries < 3:
+            started = time.monotonic()
             try:
                 await client.delete_messages(entity, chunk)
                 total += len(chunk)
-                print(f"  [{label}] {total}/{len(ids)}", end='\r')
-                await asyncio.sleep(delay)
+                done.update(chunk)
+                print(f"  [{label}] сообщения {total}/{len(ids)}", end='\r')
+                await asyncio.sleep(pace_left(started, delay))
                 break
             except FloodWaitError as e:
                 wait = e.seconds + 2
@@ -149,7 +190,7 @@ async def delete(client, entity, ids, label, batch, delay):
                 await asyncio.sleep(wait)
             except (MessageDeleteForbiddenError, ChatAdminRequiredError):
                 print(f"\n  [{label}] нет прав, пропускаю")
-                return total
+                return total, done
             except Exception as e:
                 retries += 1
                 print(f"\n  [{label}] ошибка ({retries}/3): {e}")
@@ -157,23 +198,128 @@ async def delete(client, entity, ids, label, batch, delay):
                     print(f"  [{label}] превышен лимит попыток, пропускаю чанк")
                     break
                 await asyncio.sleep(2 * retries)
-    return total
+    return total, done
 
 
-async def run_deletion(client, found, batch, delay):
+def reaction_state(r):
+    """True — есть своя реакция, False — нет, None — Telegram прислал урезанные (min) данные."""
+    if not r or not r.results:
+        return False
+    if any(rc.chosen_order is not None and not isinstance(rc.reaction, ReactionPaid) for rc in r.results):
+        return True
+    if any(p.my and not isinstance(p.reaction, ReactionPaid) for p in r.recent_reactions or ()):
+        return True
+    if r.min:
+        return None
+    return False
+
+
+async def resolve_min_reactions(client, entity, ids):
+    # Сомнительные включаем: лишний запрос дешевле пропущенной реакции
+    mine = []
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        try:
+            upd = await call_flood_safe(client, GetMessagesReactionsRequest(peer=entity, id=chunk), 'реакции')
+        except Exception:
+            mine.extend(chunk)
+            continue
+        states = {
+            u.msg_id: reaction_state(u.reactions)
+            for u in getattr(upd, 'updates', [])
+            if isinstance(u, UpdateMessageReactions)
+        }
+        mine.extend(x for x in chunk if states.get(x) is not False)
+    return mine
+
+
+# Ошибки уровня чата: повтор на других сообщениях этого чата ничего не даст
+CHAT_LEVEL_ERRORS = (
+    ChatAdminRequiredError, ChatWriteForbiddenError, UserBannedInChannelError,
+    ChannelPrivateError, PeerIdInvalidError,
+)
+
+
+async def unreact(client, entity, ids, label, delay):
+    stats = {'ok': 0, 'noop': 0, 'gone': 0, 'fail': 0}
+    chat_errors = 0
+    for n, msg_id in enumerate(ids, 1):
+        retries = 0
+        while retries < 3:
+            started = time.monotonic()
+            try:
+                # без reaction Telegram снимает все свои реакции с сообщения
+                await client(SendReactionRequest(peer=entity, msg_id=msg_id))
+                stats['ok'] += 1
+                chat_errors = 0
+                break
+            except FloodWaitError as e:
+                wait = e.seconds + 2
+                print(f"\n  FloodWait {wait}с...")
+                await asyncio.sleep(wait)
+            except MessageNotModifiedError:
+                stats['noop'] += 1
+                chat_errors = 0
+                break
+            except (MessageIdInvalidError, MsgIdInvalidError):
+                stats['gone'] += 1
+                break
+            except CHAT_LEVEL_ERRORS as e:
+                stats['fail'] += 1
+                chat_errors += 1
+                if chat_errors >= 3:
+                    print(f"\n  [{label}] {type(e).__name__} на 3 сообщениях подряд, пропускаю чат")
+                    stats['fail'] += len(ids) - n
+                    return stats
+                break
+            except ReactionInvalidError:
+                stats['fail'] += 1
+                break
+            except Exception as e:
+                retries += 1
+                print(f"\n  [{label}] ошибка на {msg_id} ({retries}/3): {e}")
+                if retries >= 3:
+                    stats['fail'] += 1
+                    break
+                await asyncio.sleep(2 * retries)
+        print(f"  [{label}] реакции {n}/{len(ids)}", end='\r')
+        await asyncio.sleep(pace_left(started, delay))
+    return stats
+
+
+def count_str(mode, msg_ids, react_ids):
+    if mode == 'msg':
+        return f"{len(msg_ids):>5} сообщ."
+    if mode == 'react':
+        return f"{len(react_ids):>5} реакц."
+    # Реакции на собственных сообщениях исчезнут вместе с ними
+    own = set(msg_ids)
+    return f"{len(msg_ids):>5} сообщ. + {sum(1 for x in react_ids if x not in own):>4} реакц."
+
+
+def totals_str(mode, found):
+    parts = []
+    if mode in ('msg', 'both'):
+        parts.append(f"Сообщений: {sum(len(m) for _, m, _, _ in found)}")
+    if mode in ('react', 'both'):
+        parts.append(f"Реакций: {sum(len(set(r) - set(m)) for _, m, r, _ in found)}")
+    return '  |  '.join(parts)
+
+
+async def run_deletion(client, found, opts, mode='msg'):
     if not found:
         print("\n[!] Ничего не нашлось.")
         return
 
     print(f"\n{'─'*60}")
-    print(f"  Чатов: {len(found)}  |  Сообщений: {sum(len(i) for _, i, _ in found)}")
+    print(f"  Чатов: {len(found)}  |  {totals_str(mode, found)}")
     print(f"{'─'*60}")
 
     raw = input("\nИсключить номера (через запятую) или Enter: ").strip()
     if raw:
         skip = {int(x) for x in raw.split(',') if x.strip().isdigit()}
-        found = [(e, ids, n) for k, (e, ids, n) in enumerate(found, 1) if k not in skip]
-        print(f"  Осталось: {len(found)} чатов, {sum(len(i) for _, i, _ in found)} сообщений")
+        found = [f for k, f in enumerate(found, 1) if k not in skip]
+        print(f"  Осталось: {len(found)} чатов  |  {totals_str(mode, found)}")
 
     if not found:
         print("Нечего удалять.")
@@ -183,62 +329,111 @@ async def run_deletion(client, found, batch, delay):
     if confirm.strip().lower() != 'yes':
         return
 
-    grand = 0
-    for entity, ids, label in found:
-        grand += await delete(client, entity, ids, label, batch, delay)
-        print()
+    grand_msg = 0
+    grand = {'ok': 0, 'noop': 0, 'gone': 0, 'fail': 0}
+    for entity, msg_ids, react_ids, label in found:
+        deleted = set()
+        if msg_ids:
+            n, deleted = await delete(client, entity, msg_ids, label, opts['batch'], opts['delay'])
+            grand_msg += n
+            print()
+        # Реакции снимаем только там, где сообщение реально осталось
+        todo = [x for x in react_ids if x not in deleted]
+        if todo:
+            st = await unreact(client, entity, todo, label, opts['react_delay'])
+            for k in grand:
+                grand[k] += st[k]
+            print()
 
-    print(f"\n[+] Готово, удалено: {grand}")
+    print()
+    if mode in ('msg', 'both'):
+        print(f"[+] Удалено сообщений: {grand_msg}")
+    if mode in ('react', 'both'):
+        print(f"[+] Снято реакций: {grand['ok']}")
+        extra = []
+        if grand['noop']:
+            extra.append(f"уже не было: {grand['noop']}")
+        if grand['gone']:
+            extra.append(f"сообщение удалено: {grand['gone']}")
+        if grand['fail']:
+            extra.append(f"не вышло: {grand['fail']}")
+        if extra:
+            print(f"    {', '.join(extra)}")
 
 
-async def collect_dialog(client, entity, is_private=False, min_date=None, max_date=None, msg_whitelist=None):
-    entity_label = getattr(entity, 'id', repr(entity))
+async def collect_dialog(client, entity, label, mode, opts, min_date=None, max_date=None, msg_whitelist=None):
+    """-> (ids сообщений, ids сообщений с моей реакцией, сколько пропущено по whitelist)"""
+    msg_ids, react_ids, skipped = [], [], set()
     try:
         chat_id = tl_utils.get_peer_id(entity)
-        entity_label = chat_id
-        wl_ids = msg_whitelist.get(chat_id, set()) if msg_whitelist else set()
-
-        kwargs = {'from_user': 'me'}
-        if max_date:
-            kwargs['offset_date'] = max_date
-
-        if not is_private:
-            while True:
-                try:
-                    probe = await client.get_messages(entity, limit=1, **kwargs)
-                    break
-                except FloodWaitError as e:
-                    print(f"\n  FloodWait (probe) {e.seconds + 2}с...")
-                    await asyncio.sleep(e.seconds + 2)
-            if not probe:
-                return [], 0
-
-        ids = []
-        skipped = 0
-        async for m in client.iter_messages(entity, **kwargs):
-            if max_date and m.date > max_date:
-                continue
-            if min_date and m.date < min_date:
-                break
-            if m.id in wl_ids:
-                skipped += 1
-            else:
-                ids.append(m.id)
-        return ids, skipped
     except Exception as e:
-        print(f"  [!] Ошибка при сканировании {entity_label}: {e}")
-        return [], 0
+        print(f"  [!] {label}: {e}")
+        return [], [], 0
+    wl_ids = msg_whitelist.get(chat_id, set()) if msg_whitelist else set()
+    base = {'offset_date': max_date} if max_date else {}
+
+    if mode in ('msg', 'both'):
+        # Серверный поиск по автору: первая же страница пустая — в чате нет моих сообщений
+        try:
+            async for m in iter_history(client, entity, opts['scan_delay'], from_user='me', **base):
+                if max_date and m.date > max_date:
+                    continue
+                if min_date and m.date < min_date:
+                    break
+                if m.id in wl_ids:
+                    skipped.add(m.id)
+                else:
+                    msg_ids.append(m.id)
+        except Exception as e:
+            print(f"  [!] {label}: скан сообщений прерван ({e}), найдено {len(msg_ids)}")
+
+    if mode in ('react', 'both'):
+        # Поиска по своим реакциям в API нет — листаем историю и смотрим флаг своей реакции
+        unknown = []
+        seen = 0
+        try:
+            async for m in iter_history(client, entity, opts['scan_delay'], **base):
+                seen += 1
+                if seen % 1000 == 0:
+                    print(f"    ...{label}: просмотрено {seen}", end='\r', flush=True)
+                if max_date and m.date > max_date:
+                    continue
+                if min_date and m.date < min_date:
+                    break
+                state = reaction_state(m.reactions)
+                if state is False:
+                    continue
+                if m.id in wl_ids:
+                    skipped.add(m.id)
+                elif state:
+                    react_ids.append(m.id)
+                else:
+                    unknown.append(m.id)
+        except Exception as e:
+            print(f"\n  [!] {label}: скан реакций прерван ({e}), найдено {len(react_ids) + len(unknown)}")
+        if seen >= 1000:
+            print(' ' * 100, end='\r')
+        if unknown:
+            react_ids += await resolve_min_reactions(client, entity, unknown)
+
+    return msg_ids, react_ids, len(skipped)
 
 
-async def source_session(client, msg_whitelist, whitelist, batch, delay):
+async def source_session(client, msg_whitelist, whitelist, opts, mode='msg'):
     while True:
         print("\nЧто сканируем (можно несколько через запятую):")
         print("  0 - назад")
         print("  1 - личные сообщения")
         print("  2 - малые группы")
         print("  3 - супергруппы")
-        print("  4 - публикации от имени каналов")
+        print({
+            'msg': "  4 - публикации от имени каналов",
+            'react': "  4 - каналы",
+            'both': "  4 - каналы (свои публикации + реакции)",
+        }[mode])
         print("  5 - конкретные чаты")
+        if mode != 'msg':
+            print("  [i] Реакции ищутся перебором всей истории — сужай даты, иначе будет долго.")
 
         raw = input("Выбор: ").strip()
         if not raw or raw == '0':
@@ -269,22 +464,21 @@ async def source_session(client, msg_whitelist, whitelist, batch, delay):
                 t = int(target) if target.lstrip('-').isdigit() else target
                 try:
                     entity = await client.get_entity(t)
-                    ids, skipped = await collect_dialog(
-                        client, entity,
-                        is_private=isinstance(entity, User),
+                    label = fmt_entity(entity)
+                    msg_ids, react_ids, skipped = await collect_dialog(
+                        client, entity, label, mode, opts,
                         min_date=min_date, max_date=max_date,
                         msg_whitelist=msg_whitelist
                     )
-                    label = fmt_entity(entity)
                     skipped_str = f"  [whitelist: {skipped}]" if skipped else ""
-                    if ids:
-                        found.append((entity, ids, label))
-                        print(f"  {len(found):>3}.  {label}: {len(ids)} сообщений{skipped_str}")
+                    if msg_ids or react_ids:
+                        found.append((entity, msg_ids, react_ids, label))
+                        print(f"  {len(found):>3}.  {count_str(mode, msg_ids, react_ids)}  {label}{skipped_str}")
                     else:
-                        print(f"        {label}: 0 сообщений{skipped_str}")
+                        print(f"        {count_str(mode, msg_ids, react_ids)}  {label}{skipped_str}")
                 except Exception as e:
                     print(f"  [!] '{target}' не вышло: {e}")
-            await run_deletion(client, found, batch, delay)
+            await run_deletion(client, found, opts, mode)
             continue
 
         bot_filter = None
@@ -313,31 +507,73 @@ async def source_session(client, msg_whitelist, whitelist, batch, delay):
                 if bool(getattr(d.entity, 'bot', False)) != bot_filter:
                     continue
 
-            ids, skipped = await collect_dialog(
-                client, d.entity,
-                is_private=isinstance(d.entity, User),
+            label = fmt(d)
+            msg_ids, react_ids, skipped = await collect_dialog(
+                client, d.entity, label, mode, opts,
                 min_date=min_date, max_date=max_date,
                 msg_whitelist=msg_whitelist
             )
-            if ids:
-                label = fmt(d)
-                found.append((d.entity, ids, label))
+            if msg_ids or react_ids:
+                found.append((d.entity, msg_ids, react_ids, label))
                 skipped_str = f"  [whitelist: {skipped}]" if skipped else ""
-                print(f"  {len(found):>3}.  {len(ids):>5} сообщ.  {label}{skipped_str}")
+                print(f"  {len(found):>3}.  {count_str(mode, msg_ids, react_ids)}  {label}{skipped_str}")
 
-        await run_deletion(client, found, batch, delay)
+        await run_deletion(client, found, opts, mode)
+
+
+def show_qr(url):
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(url)
+        qr.print_ascii(invert=True)
+    except ImportError:
+        print("  [!] Для QR в консоли: python -m pip install qrcode")
+        print(f"  Ссылка (можно вставить в любой генератор QR): {url}")
+
+
+async def login(client):
+    await client.connect()
+    if await client.is_user_authorized():
+        return
+
+    print("\nСессия не авторизована. Вход:\n  1 - по QR-коду (код в ТГ не нужен)\n  2 - по номеру телефона")
+    if input("Выбор: ").strip() == '2':
+        await client.start()
+        return
+
+    print("\nТелефон: Настройки → Устройства → Подключить устройство, отсканируй QR.")
+    qr = await client.qr_login()
+    while True:
+        show_qr(qr.url)
+        try:
+            await qr.wait()
+            return
+        except asyncio.TimeoutError:
+            print("\n  QR истёк, генерирую новый...")
+            await qr.recreate()
+        except SessionPasswordNeededError:
+            await client.sign_in(password=getpass("  Облачный пароль (2FA): "))
+            return
 
 
 async def main():
     cfg = load_config()
     api_id = cfg.getint('settings', 'api_id')
     api_hash = cfg.get('settings', 'api_hash')
-    batch = cfg.getint('settings', 'batch')
     delay = cfg.getfloat('settings', 'delay')
+    opts = {
+        'batch': cfg.getint('settings', 'batch'),
+        'delay': delay,
+        'react_delay': cfg.getfloat('settings', 'react_delay', fallback=delay),
+        'scan_delay': cfg.getfloat('settings', 'scan_delay', fallback=0.3),
+    }
     whitelist = parse_whitelist(cfg)
     msg_entries = parse_msg_whitelist_entries(cfg)
 
-    async with TelegramClient('session', api_id, api_hash) as client:
+    client = TelegramClient('session', api_id, api_hash)
+    await login(client)
+    async with client:
         me = await client.get_me()
         print(f"\n[+] Привет, {me.first_name}  (uid:{me.id})")
 
@@ -347,16 +583,32 @@ async def main():
             print(f"  message_whitelist: {total} сообщ. в {len(msg_whitelist)} чатах")
 
         while True:
-            print("\nЧто делаем:\n  1 - удалить сообщения\n  2 - выход")
+            print(
+                "\nЧто делаем:\n  1 - удалить сообщения\n  2 - удалить реакции\n  3 - удалить сообщения и реакции"
+                "\n  4 - выход\n  5 - завершить сессию удалятора и выйти"
+            )
             src = input("Выбор: ").strip()
 
             if src == '1':
-                await source_session(client, msg_whitelist, whitelist, batch, delay)
+                await source_session(client, msg_whitelist, whitelist, opts)
             elif src == '2':
+                await source_session(client, msg_whitelist, whitelist, opts, mode='react')
+            elif src == '3':
+                await source_session(client, msg_whitelist, whitelist, opts, mode='both')
+            elif src == '4':
                 print("Пока.")
+                break
+            elif src == '5':
+                confirm = input("[?] Сессия будет завершена в Telegram, файл session.session удалён. Дальше нужен новый вход. [yes/N]: ")
+                if confirm.strip().lower() != 'yes':
+                    continue
+                if await client.log_out():
+                    print("[+] Сессия завершена, файл сессии удалён. Пока.")
+                else:
+                    print("[!] Telegram не принял выход. Заверши сессию вручную: Настройки → Устройства.")
                 break
             else:
                 print("Нет такого варианта.")
 
 
-asyncio.run(main())
+asyncio.run(main())
